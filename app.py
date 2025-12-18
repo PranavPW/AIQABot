@@ -1,5 +1,5 @@
 import gradio as gr
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -9,6 +9,7 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 import warnings
 import os
+import requests
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -16,6 +17,68 @@ warnings.filterwarnings('ignore')
 # Global cache for vector stores
 # Key: file_path, Value: items associated with that file (e.g., vectordb or retriever)
 vector_store_cache = {}
+
+## Model Fetching Helpers
+def get_ollama_models(base_url):
+    """Fetch models from Ollama /api/tags"""
+    try:
+        if not base_url.startswith("http"):
+            base_url = f"http://{base_url}"
+        
+        # Strip /v1 if present for native tagging
+        tag_url = base_url.replace("/v1", "") if base_url.endswith("/v1") else base_url
+        response = requests.get(f"{tag_url}/api/tags")
+        if response.status_code == 200:
+            data = response.json()
+            # Ollama models are usually in 'models' key with 'name' field
+            return [model['name'] for model in data.get('models', [])]
+        return []
+    except Exception as e:
+        print(f"Error fetching Ollama models: {e}")
+        return []
+
+def get_openai_models(base_url, api_key):
+    """Fetch models from OpenAI-compatible /v1/models"""
+    try:
+        if not base_url.startswith("http"):
+            base_url = f"http://{base_url}"
+            
+        headers = {"Authorization": f"Bearer {api_key}"}
+        response = requests.get(f"{base_url}/models", headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            return [model['id'] for model in data.get('data', [])]
+        return []
+    except Exception as e:
+        print(f"Error fetching OpenAI/LM Studio models: {e}")
+        return []
+
+def refresh_models(provider, host, port, api_key):
+    """
+    Constructs URL and fetches models based on provider.
+    Returns updates for both LLM and Embedding dropdowns.
+    """
+    base_url = f"http://{host}:{port}"
+    models = []
+    
+    if provider == "Ollama":
+        models = get_ollama_models(base_url)
+    elif provider in ["LM Studio", "OpenAI"]:
+        # For LM Studio, usually http://localhost:1234/v1
+        full_url = f"{base_url}/v1"
+        models = get_openai_models(full_url, api_key)
+    
+    # If no models found, return empty list or keep current if possible, 
+    # but here we just return what we found.
+    # We return the same list for both LLM and Embedding for simplicity, 
+    # though usually embedding models are distinct. User selects from the same list.
+    
+    if not models:
+        return gr.update(choices=[]), gr.update(choices=[])
+        
+    return gr.update(choices=models, value=models[0] if models else None), \
+           gr.update(choices=models, value=models[0] if models else None)
+
 
 ## LLM
 def get_llm(base_url, api_key, model_name):
@@ -61,23 +124,28 @@ def text_splitter(data):
     return chunks
 
 ## Embedding model
-def get_embedding_model(base_url, model_name):
+def get_embedding_model(base_url, model_name, provider, api_key):
     """
-    Initializes and returns an OllamaEmbeddings instance.
-    Notes: Ollama base URL usually doesn't need /v1 for native embedding endpoints, 
-    but LangChain's OllamaEmbeddings class handles base_url standardly (often e.g. http://localhost:11434).
-    The user provided input typically has /v1. We might need to strip or adjust if issues arise.
-    Standard Ollama URL: http://localhost:11434
+    Initializes and returns an embedding model instance.
     """
-    # Simple check: if the user provides a /v1 url for OpenAI compatibility, 
-    # OllamaEmbeddings often defaults to native API. 
-    # We will strip '/v1' just in case if the user provides it, to be safe for the native wrapper.
-    clean_base_url = base_url.replace("/v1", "") if base_url.endswith("/v1") else base_url
-    
-    embeddings = OllamaEmbeddings(
-        base_url=clean_base_url,
-        model=model_name
-    )
+    if provider == "Ollama":
+        # Simple check: if the user provides a /v1 url for OpenAI compatibility, 
+        # OllamaEmbeddings often defaults to native API. 
+        # We will strip '/v1' just in case if the user provides it, to be safe for the native wrapper.
+        clean_base_url = base_url.replace("/v1", "") if base_url.endswith("/v1") else base_url
+        
+        embeddings = OllamaEmbeddings(
+            base_url=clean_base_url,
+            model=model_name
+        )
+    else:
+        # For LM Studio (OpenAI compatible)
+        embeddings = OpenAIEmbeddings(
+            base_url=base_url,
+            api_key=api_key,
+            model=model_name,
+            check_embedding_ctx_length=False
+        )
     return embeddings
 
 ## Vector db with Caching
@@ -86,7 +154,6 @@ def get_vector_store(file_path, embedding_model):
     Creates or retrieves a cached Chroma vector database from text chunks.
     Args:
         file_path: Path to the pdf file.
-        embedding_model: The embedding model instance.
     Returns:
         A Chroma vector database instance.
     """
@@ -103,7 +170,7 @@ def get_vector_store(file_path, embedding_model):
     return vectordb
 
 ## QA Chain
-def retriever_qa(file, query, base_url, api_key, llm_model_name, embedding_model_name):
+def retriever_qa(file, query, provider, host, port, api_key, llm_model_name, embedding_model_name):
     """
     Performs a question-answering task using the RAG chain.
     """
@@ -111,9 +178,14 @@ def retriever_qa(file, query, base_url, api_key, llm_model_name, embedding_model
         if file is None:
             return "Please upload a PDF file first."
 
+        # Construct Base URL
+        base_url = f"http://{host}:{port}"
+        if provider != "Ollama": # appends /v1 for OpenAI compatible
+             base_url = f"{base_url}/v1"
+        
         # Initialize models
         llm = get_llm(base_url, api_key, llm_model_name)
-        embedding_model = get_embedding_model(base_url, embedding_model_name)
+        embedding_model = get_embedding_model(base_url, embedding_model_name, provider, api_key)
         
         # Get Vector Store (Cached)
         vectordb = get_vector_store(file, embedding_model)
@@ -149,7 +221,14 @@ def retriever_qa(file, query, base_url, api_key, llm_model_name, embedding_model
         return response['answer']
         
     except Exception as e:
-        return f"Error occurred: {str(e)}\n\nPlease ensure your Ollama server is running and the models ({llm_model_name}, {embedding_model_name}) are installed."
+        return f"Error occurred: {str(e)}\n\nPlease ensure your Server is running at http://{host}:{port} and models are available."
+
+def update_port(provider):
+    if provider == "Ollama":
+        return "11434"
+    elif provider == "LM Studio":
+        return "1234"
+    return "8000"
 
 # Create Gradio interface
 with gr.Blocks() as rag_application:
@@ -160,24 +239,41 @@ with gr.Blocks() as rag_application:
         with gr.Column(scale=1):
             file_input = gr.File(label="Upload PDF File", file_count="single", file_types=['.pdf'], type="filepath")
             
-            with gr.Accordion("Advanced Settings", open=False):
-                base_url_input = gr.Textbox(label="Base URL", value="http://localhost:11434/v1")
-                api_key_input = gr.Textbox(label="API Key", value="ollama")
-                llm_model_input = gr.Textbox(label="LLM Model", value="qwen2.5:latest")
-                embedding_model_input = gr.Textbox(label="Embedding Model", value="nomic-embed-text")
-        
+            with gr.Accordion("Model Settings", open=True):
+                with gr.Row():
+                    provider_input = gr.Dropdown(choices=["Ollama", "LM Studio", "OpenAI"], value="Ollama", label="Provider")
+                    host_input = gr.Textbox(label="Host", value="localhost")
+                    port_input = gr.Textbox(label="Port", value="11434")
+                
+                api_key_input = gr.Textbox(label="API Key", value="ollama", type="password")
+                refresh_btn = gr.Button("Refresh Models")
+                
+                llm_model_input = gr.Dropdown(label="LLM Model", choices=["qwen2.5:latest"], value="qwen2.5:latest", allow_custom_value=True)
+                embedding_model_input = gr.Dropdown(label="Embedding Model", choices=["nomic-embed-text"], value="nomic-embed-text", allow_custom_value=True)
+
         with gr.Column(scale=2):
             query_input = gr.Textbox(label="Input Query", lines=2, placeholder="Type your question here...")
             output_text = gr.Textbox(label="Output", lines=10)
             submit_btn = gr.Button("Submit")
             clear_btn = gr.Button("Clear Output")
 
+    # Event Listeners
+    provider_input.change(fn=update_port, inputs=provider_input, outputs=port_input)
+    
+    refresh_btn.click(
+        fn=refresh_models,
+        inputs=[provider_input, host_input, port_input, api_key_input],
+        outputs=[llm_model_input, embedding_model_input]
+    )
+
     submit_btn.click(
         fn=retriever_qa,
         inputs=[
             file_input, 
             query_input, 
-            base_url_input, 
+            provider_input,
+            host_input,
+            port_input,
             api_key_input, 
             llm_model_input, 
             embedding_model_input

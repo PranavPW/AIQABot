@@ -6,3 +6,5 @@ pypdf
 gradio
 
 langchain-text-splitters
+
+requests

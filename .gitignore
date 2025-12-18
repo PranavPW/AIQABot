@@ -1,0 +1,18 @@
+# Virtual Environments
+venv*
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Test and Debug Scripts
+debug_*.py
+verify_*.py
+inspect_*.py
+install_log.txt
+installed.txt
+debug_results.txt
+
+# Temporary Files
+RAGtemp

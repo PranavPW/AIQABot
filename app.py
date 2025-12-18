@@ -94,17 +94,29 @@ def get_llm(base_url, api_key, model_name):
     return llm
 
 ## Document loader
-def document_loader(file_path):
+def document_loader(file_paths):
     """
-    Loads a PDF document from the given file path.
+    Loads PDF documents from the given list of file paths.
     Args:
-        file_path: The absolute path to the PDF file (string).
+        file_paths: A list of absolute paths to the PDF files (list of strings).
     Returns:
         A list of loaded documents.
     """
-    loader = PyPDFLoader(file_path)
-    loaded_document = loader.load()
-    return loaded_document
+    if not isinstance(file_paths, list):
+         file_paths = [file_paths]
+         
+    all_documents = []
+    for path in file_paths:
+        try:
+            loader = PyPDFLoader(path)
+            all_documents.extend(loader.load())
+        except Exception as e:
+            print(f"Error loading file {path}: {e}")
+            
+    if not all_documents:
+        raise ValueError("No documents could be loaded from the provided files.")
+        
+    return all_documents
 
 ## Text splitter
 def text_splitter(data):
@@ -149,24 +161,31 @@ def get_embedding_model(base_url, model_name, provider, api_key):
     return embeddings
 
 ## Vector db with Caching
-def get_vector_store(file_path, embedding_model):
+def get_vector_store(file_paths, embedding_model):
     """
     Creates or retrieves a cached Chroma vector database from text chunks.
     Args:
-        file_path: Path to the pdf file.
+        file_paths: List of paths to the pdf files.
     Returns:
         A Chroma vector database instance.
     """
-    if file_path in vector_store_cache:
-        print(f"Using cached vector store for: {file_path}")
-        return vector_store_cache[file_path]
+    # Create a unique cache key based on the sorted list of file paths
+    # This ensures consistency regardless of upload order
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+        
+    cache_key = tuple(sorted(file_paths))
     
-    print(f"Generating new vector store for: {file_path}")
-    docs = document_loader(file_path)
+    if cache_key in vector_store_cache:
+        print(f"Using cached vector store for files: {cache_key}")
+        return vector_store_cache[cache_key]
+    
+    print(f"Generating new vector store for files: {cache_key}")
+    docs = document_loader(file_paths)
     chunks = text_splitter(docs)
     vectordb = Chroma.from_documents(chunks, embedding_model)
     
-    vector_store_cache[file_path] = vectordb
+    vector_store_cache[cache_key] = vectordb
     return vectordb
 
 ## QA Chain
@@ -175,13 +194,12 @@ def retriever_qa(file, query, provider, host, port, api_key, llm_model_name, emb
     Performs a question-answering task using the RAG chain.
     """
     try:
-        if file is None:
-            return "Please upload a PDF file first."
+        if not file: # empty list is falsy
+            return "Please upload at least one PDF file first."
 
         # Construct Base URL
-        base_url = f"http://{host}:{port}"
-        if provider != "Ollama": # appends /v1 for OpenAI compatible
-             base_url = f"{base_url}/v1"
+        # ChatOpenAI requires /v1 for Ollama as well (since we aren't using ChatOllama)
+        base_url = f"http://{host}:{port}/v1"
         
         # Initialize models
         llm = get_llm(base_url, api_key, llm_model_name)
@@ -221,7 +239,9 @@ def retriever_qa(file, query, provider, host, port, api_key, llm_model_name, emb
         return response['answer']
         
     except Exception as e:
-        return f"Error occurred: {str(e)}\n\nPlease ensure your Server is running at http://{host}:{port} and models are available."
+        import traceback
+        traceback.print_exc()
+        return f"Error: {str(e)}\n\nDebug Info:\nProvider: {provider}\nBase URL: {base_url}\nLLM: {llm_model_name}\nEmbedding: {embedding_model_name}"
 
 def update_port(provider):
     if provider == "Ollama":
@@ -237,7 +257,7 @@ with gr.Blocks() as rag_application:
 
     with gr.Row():
         with gr.Column(scale=1):
-            file_input = gr.File(label="Upload PDF File", file_count="single", file_types=['.pdf'], type="filepath")
+            file_input = gr.File(label="Upload PDF File(s)", file_count="multiple", file_types=['.pdf'], type="filepath")
             
             with gr.Accordion("Model Settings", open=True):
                 with gr.Row():

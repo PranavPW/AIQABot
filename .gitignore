@@ -16,3 +16,6 @@ debug_results.txt
 
 # Temporary Files
 RAGtemp
+
+# Data
+*.pdf
